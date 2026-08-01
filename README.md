@@ -37,7 +37,7 @@ An intelligent agent built with **LangGraph** and **Groq** to track, filter, and
 
 ## ⚙️ Configuration
 
-Create a `.env` file in the root directory and add your Groq API key:
+Create a `.env` file in the root directory and add your Groq API key (you can find in https://console.groq.com/keys):
 
 ```env
 GROQ_API_KEY=your_lp_api_key_here
