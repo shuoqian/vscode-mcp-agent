@@ -81,3 +81,13 @@ The architecture is designed to be **MCP-Ready**. While currently integrated, th
 This decoupling allows the core reasoning agent to be hosted in different environments (CLI, Claude Desktop, Cursor) while reusing the same toolsets.
 
 **Current Status:** The agent is logically decoupled to be MCP-Ready, but currently uses integrated Python tools for GitHub interaction and state management. Transitioning to a formal MCP Client/Server architecture is slated for a future module.
+
+## 8. Core Design Reasoning
+To solve the problem of information overload in open-source tracking, this agent relies on four specific architectural pillars:
+
+*   **Reasoning Loop (ReAct & Reflection):** The agent implements a ReAct-based loop to evaluate individual issues. Reasoning steps guide actions by checking specific criteria (e.g., "Does this match the target OS?"). Observations (the LLM's 'YES' or 'NO' response) influence subsequent decisions: a 'NO' observation on a relevance check immediately triggers an action to discard the issue, while a 'YES' observation leads to a deduplication check. Finally, the **Reflection Loop** audits the final candidate pool, deciding whether to re-evaluate the raw data based on observed pool quality.
+*   **Memory Requirements (Short and Long Term):** 
+    *   **Short-Term Memory:** Managed via `AgentState` to maintain the candidate pool and execution logs during a single session. This is needed because the final synthesis node must process information gathered across multiple independent issue-evaluation loops.
+    *   **Long-Term Memory:** Required for **Cross-Session Deduplication**. Without long-term memory (e.g., vector store), the agent would repeatedly alert the user about the same persistent issue every time it runs.
+*   **Tool Grounding:** The use of an external **GitHub REST API tool** is necessary to resolve the limitation of "LLM Knowledge Cutoff." By fetching live issues, the agent grounds its reasoning in real-time repository state, ensuring it never summarizes stale or resolved data.
+*   **Comparison to Prompt-Only Approach:** A prompt-only approach fails when faced with **Context Bloat** (e.g., trying to read 100 GitHub issues in one context window). This leads to hallucinations and missed details. Our design resolves this failure mode by isolating each issue into its own reasoning step, ensuring high-fidelity analysis that scales regardless of the number of issues fetched.
