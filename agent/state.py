@@ -28,6 +28,17 @@ class AgentState(TypedDict):
     hard_label_groups: Dict[str, List[str]]
     soft_labels: List[str]
 
+    # NEW: free-text search terms used ONLY when the Tree-of-Thought planner
+    # selects the "keyword" branch (i.e. no reliable labels exist for one or
+    # more categories, so free-text search is the winning strategy instead).
+    # Empty for the "narrow"/"broad" branches, which rely on label filters.
+    text_keywords: List[str]
+
+    # NEW: records which Tree-of-Thought candidate strategies were generated,
+    # their estimated result counts/scores, and which one won — purely for
+    # transparency/logging, not consumed by downstream nodes.
+    tot_branch_trace: List[Dict[str, Any]]
+
     # Kept for backward compatibility / display purposes only.
     hard_labels: List[str]
     matched_labels: List[str]

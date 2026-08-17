@@ -59,6 +59,8 @@ async def main():
         "constructed_query": "",
         "plan_tasks": [],
         "hard_label_groups": {},
+        "text_keywords": [],
+        "tot_branch_trace": [],
         "hard_labels": [],
         "soft_labels": [],
         "matched_labels": [],

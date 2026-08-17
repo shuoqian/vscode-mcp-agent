@@ -9,6 +9,7 @@ from agent.state import AgentState
 from agent.tools import (
     GitHubLabelManager,
     fetch_github_issues_tool,
+    estimate_issue_count,
     check_vector_memory_duplicate,
     save_issues_to_vector_memory
 )
@@ -146,11 +147,61 @@ async def planner_node(state: AgentState):
         "os": set(label_manager.find_related_labels(target_os, all_repo_labels)),
     }
 
-    hard_label_groups: dict[str, list[str]] = {
+    # ---------------------------------------------------------------
+    # TREE-OF-THOUGHT QUERY STRATEGY SELECTION
+    #
+    # Rather than committing to a single merged label strategy, generate
+    # multiple DISTINCT candidate branches, evaluate each with a cheap
+    # count-only GitHub call (run in parallel), and pick the branch that
+    # actually performs best — instead of only discovering a strategy is
+    # bad after a full fetch fails (that reactive fallback still exists
+    # downstream in fetch_github_issues_tool as a safety net, but this
+    # node now does proactive branch comparison up front).
+    #
+    #   Branch "narrow"  — one most-confident label per category (highest
+    #                       precision, most likely to under-match)
+    #   Branch "broad"   — full union of LLM + scan matches per category,
+    #                       OR'd together (highest recall via labels)
+    #   Branch "keyword" — no label filters at all; falls back to free-text
+    #                       search on the raw module/type/os terms (covers
+    #                       the case where no reliable labels exist at all)
+    #
+    # Each branch is scored by its estimated result count: 0 results is
+    # disqualifying, a count within a reasonable "sweet spot" window scores
+    # highest (favoring precision within that window), and an excessive
+    # count is penalized (too broad to trust) but still preferred over zero.
+    # ---------------------------------------------------------------
+    since_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    def _top_label(llm_set: set[str], scan_set: set[str]) -> list[str]:
+        # Prefer the LLM's semantic pick (it has more context) over the raw
+        # scan; fall back to the scan's first alphabetical match if the LLM
+        # found nothing for this category.
+        if llm_set:
+            return [sorted(llm_set)[0]]
+        if scan_set:
+            return [sorted(scan_set)[0]]
+        return []
+
+    narrow_groups = {
+        "module": _top_label(llm_groups["module"], scan_groups["module"]),
+        "type": _top_label(llm_groups["type"], scan_groups["type"]),
+        "os": _top_label(llm_groups["os"], scan_groups["os"]),
+    }
+    broad_groups = {
         "module": sorted(llm_groups["module"] | scan_groups["module"]),
         "type": sorted(llm_groups["type"] | scan_groups["type"]),
         "os": sorted(llm_groups["os"] | scan_groups["os"]),
     }
+    keyword_terms = [t for t in (target_module, issue_type, target_os) if t]
+
+    candidate_branches = [
+        {"name": "narrow", "hard_label_groups": narrow_groups, "text_keywords": []},
+        {"name": "broad", "hard_label_groups": broad_groups, "text_keywords": []},
+        {"name": "keyword", "hard_label_groups": {"module": [], "type": [], "os": []}, "text_keywords": keyword_terms},
+    ]
+
+    hard_label_groups, text_keywords, tot_trace = await select_query_strategy_tot(candidate_branches, since_date)
     soft_labels = sorted(llm_groups.get("symptom", set()))
 
     # Task 2 now checks ONLY the symptom — OS is already enforced as a hard
@@ -165,16 +216,18 @@ async def planner_node(state: AgentState):
     # constructed_query here is just for display/logging — the ACTUAL query used
     # is determined by fetch_github_issues_tool's progressive relaxation, since it
     # may drop whole categories if the full set returns zero results.
-    since_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
     preview_parts = ["repo:microsoft/vscode", "is:issue", "state:open", f"created:>={since_date}"]
     for cat in ("module", "type", "os"):
         labels = hard_label_groups[cat]
         if labels:
             preview_parts.append("label:" + ",".join(f'"{l}"' for l in labels))
+    for kw in text_keywords:
+        preview_parts.append(f'"{kw.replace("-", " ").strip()}"')
     constructed_query = " ".join(preview_parts)
 
     print(f"\n  ├─► [Constructed Query Preview]: {constructed_query}")
     print(f"  ├─► Hard Label Groups (OR within category, AND across): {hard_label_groups}")
+    print(f"  ├─► Text Keywords (ToT 'keyword' branch only): {text_keywords}")
     print(f"  ├─► Soft Labels (judge context only, symptom): {soft_labels}")
     print(f"  └─► Unmatched Keywords (informational only, not queried): {unmatched_keywords}")
 
@@ -184,6 +237,8 @@ async def planner_node(state: AgentState):
         "constructed_query": constructed_query,
         "plan_tasks": plan_tasks,
         "hard_label_groups": hard_label_groups,
+        "text_keywords": text_keywords,
+        "tot_branch_trace": tot_trace,
         "hard_labels": flat_hard_labels,  # backward-compat flat view
         "soft_labels": soft_labels,
         "matched_labels": flat_hard_labels + soft_labels,  # backward-compat display field
@@ -194,15 +249,92 @@ async def planner_node(state: AgentState):
 
 
 # =====================================================================
+# TREE-OF-THOUGHT: query strategy branch generation + evaluation
+# =====================================================================
+
+# Result-count "sweet spot" for scoring candidate branches: too few (0) means
+# the branch is unusable; too many suggests the filter is too loose to trust
+# as topically precise. Both are penalized relative to a count inside this
+# window, but a large count is still preferred over zero.
+TOT_SWEET_SPOT_MIN = 1
+TOT_SWEET_SPOT_MAX = 40
+
+
+def _score_branch_count(count: int) -> float:
+    if count <= 0:
+        return -1000.0  # disqualifying — branch would return nothing
+    if TOT_SWEET_SPOT_MIN <= count <= TOT_SWEET_SPOT_MAX:
+        # Within the sweet spot: prefer smaller (more precise) counts, but
+        # any in-range count beats any out-of-range count.
+        return 1000.0 - count
+    # Too many results to trust as topically precise — still usable, but
+    # scored below every in-range branch, worsening the further over it is.
+    return -float(count - TOT_SWEET_SPOT_MAX)
+
+
+async def select_query_strategy_tot(
+        branches: list[dict[str, Any]], since_date: str
+) -> tuple[dict[str, list[str]], list[str], list[dict[str, Any]]]:
+    """
+    Tree-of-Thought branch selection for query construction.
+
+    Given several DISTINCT candidate strategies (each a full hard-label-group
+    + text-keyword configuration), this:
+      1. Builds each branch's query string.
+      2. Evaluates all branches IN PARALLEL via a cheap count-only GitHub
+         call (estimate_issue_count) — this is the "evaluator" step of ToT.
+      3. Scores each branch by its estimated result count.
+      4. Selects the highest-scoring branch and returns its configuration.
+
+    This is genuine multi-path exploration-and-compare, not just sequential
+    retry-on-failure: all branches are generated and evaluated up front,
+    and the choice between them is made by comparing scores, not by trying
+    one until it fails and only then trying the next.
+
+    Returns: (winning_hard_label_groups, winning_text_keywords, trace)
+    where `trace` is a list of per-branch {name, query, count, score} dicts
+    for transparency/logging (and for the design doc / demo).
+    """
+    async def _evaluate(branch: dict[str, Any]) -> dict[str, Any]:
+        from agent.tools import _build_query  # local import avoids polluting module namespace
+        query = _build_query(branch["hard_label_groups"], since_date, branch.get("text_keywords", []))
+        count = await estimate_issue_count(query)
+        score = _score_branch_count(count)
+        return {
+            "name": branch["name"],
+            "hard_label_groups": branch["hard_label_groups"],
+            "text_keywords": branch.get("text_keywords", []),
+            "query": query,
+            "count": count,
+            "score": score,
+        }
+
+    evaluated = await asyncio.gather(*[_evaluate(b) for b in branches])
+
+    print("\n  🌳 [TREE-OF-THOUGHT] Exploring candidate query strategies in parallel:")
+    for b in evaluated:
+        print(f"     ├─ Branch '{b['name']}': ~{b['count']} result(s), score={b['score']:.0f}  →  {b['query']}")
+
+    winner = max(evaluated, key=lambda b: b["score"])
+    print(f"     └─► Selected branch: '{winner['name']}' (score={winner['score']:.0f}, ~{winner['count']} result(s))")
+
+    return winner["hard_label_groups"], winner["text_keywords"], evaluated
+
+
+# =====================================================================
 # NODE 2: Fetch & Cross-Session Vector Memory Node
 # =====================================================================
 async def fetch_issues_node(state: AgentState):
     days = state["time_range_days"]
     hard_label_groups = state.get("hard_label_groups", {})
+    text_keywords = state.get("text_keywords", [])
 
-    print(f"\n[Fetch Node] Attempting fetch with hard label groups: {hard_label_groups}")
+    print(f"\n[Fetch Node] Attempting fetch with hard label groups: {hard_label_groups} "
+          f"(text_keywords: {text_keywords})")
 
-    raw_issues, query_used, used_unfiltered_fallback = await fetch_github_issues_tool(hard_label_groups, days)
+    raw_issues, query_used, used_unfiltered_fallback = await fetch_github_issues_tool(
+        hard_label_groups, days, text_keywords=text_keywords
+    )
 
     print(f"[Fetch Result] Query actually used: {query_used}")
     if used_unfiltered_fallback:

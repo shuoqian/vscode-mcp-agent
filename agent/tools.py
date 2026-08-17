@@ -215,10 +215,13 @@ class GitHubLabelManager:
 CATEGORY_DROP_ORDER = ["os", "module", "type"]
 
 
-def _build_query(hard_label_groups: dict[str, list[str]], since_date: str) -> str:
+def _build_query(hard_label_groups: dict[str, list[str]], since_date: str, text_keywords: list[str] | None = None) -> str:
     """
     Builds a GitHub search query where labels WITHIN a category are OR'd
     (label:"a","b") and categories are AND'd (separate label: qualifiers).
+    Optional `text_keywords` are appended as quoted free-text phrases — used
+    by the ToT "keyword" branch, which deliberately skips label filters
+    entirely in favor of a text-search strategy.
     """
     parts = [
         "repo:microsoft/vscode",
@@ -233,7 +236,39 @@ def _build_query(hard_label_groups: dict[str, list[str]], since_date: str) -> st
             continue
         quoted = ",".join(f'"{l}"' for l in labels)
         parts.append(f"label:{quoted}")
+
+    for kw in (text_keywords or []):
+        clean_kw = (kw or "").replace("-", " ").strip()
+        if clean_kw:
+            parts.append(f'"{clean_kw}"')
+
     return " ".join(parts)
+
+
+async def estimate_issue_count(query: str) -> int:
+    """
+    Lightweight count-only GitHub search (per_page=1) used purely to SCORE a
+    candidate query strategy without paying the cost of a full fetch. This is
+    the evaluation step in the planner's Tree-of-Thought branch selection:
+    each candidate query strategy is scored by how many results it would
+    plausibly return, before committing to one.
+    """
+    headers = {"User-Agent": "VSCode-Agentic-Tracer"}
+    github_token = os.getenv("GITHUB_TOKEN")
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+
+    url = f"https://api.github.com/search/issues?q={urllib.parse.quote(query)}&per_page=1"
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                return int(resp.json().get("total_count", 0) or 0)
+            print(f"  ⚠️ [ToT Estimate Warning] Count query returned HTTP {resp.status_code} for: {query}")
+        except Exception as e:
+            print(f"  ⚠️ [ToT Estimate Exception]: {e} for query: {query}")
+    return 0
 
 
 async def _run_search(query: str) -> list[dict]:
@@ -256,28 +291,34 @@ async def _run_search(query: str) -> list[dict]:
     return []
 
 
-async def fetch_github_issues_tool(hard_label_groups: dict[str, list[str]], days: int = 30) -> tuple[list[dict], str, bool]:
+async def fetch_github_issues_tool(hard_label_groups: dict[str, list[str]], days: int = 30,
+                                   text_keywords: list[str] | None = None) -> tuple[list[dict], str, bool]:
     """
     Fetches GitHub issues using PROGRESSIVE CATEGORY relaxation instead of a
     single all-or-nothing query:
 
       1. Try with ALL categories active, each OR'd internally (module labels
          OR'd together, AND'd against type labels OR'd together, AND'd
-         against os labels OR'd together).
+         against os labels OR'd together), plus any text_keywords the caller
+         supplied (e.g. from the ToT "keyword" branch).
       2. If empty, drop one whole category at a time (per CATEGORY_DROP_ORDER
-         — os first, then module, then type) and retry.
+         — os first, then module, then type) and retry, keeping text_keywords
+         active throughout.
       3. If still empty with every category dropped, fall back to date+state
-         only, flagged as `used_unfiltered_fallback=True` so callers/logs
-         know the results are NOT topically filtered.
+         only (text_keywords dropped too, since at that point we're
+         deliberately giving up on all topical filtering), flagged as
+         `used_unfiltered_fallback=True` so callers/logs know the results
+         are NOT topically filtered.
 
     Returns: (cleaned_issues, query_actually_used, used_unfiltered_fallback)
     """
     since_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    text_keywords = text_keywords or []
 
     # Work on a mutable copy so we can drop categories without mutating the
     # caller's state dict.
     active_groups = {k: list(v) for k, v in hard_label_groups.items()}
-    query_used = _build_query(active_groups, since_date)
+    query_used = _build_query(active_groups, since_date, text_keywords)
     items = await _run_search(query_used)
     used_unfiltered_fallback = False
 
@@ -289,7 +330,7 @@ async def fetch_github_issues_tool(hard_label_groups: dict[str, list[str]], days
         active_groups[cat_to_drop] = []
         print(f"  ⚠️ [Query Relaxation] No results — dropping category '{cat_to_drop}' "
               f"(labels: {dropped_labels}) and retrying...")
-        query_used = _build_query(active_groups, since_date)
+        query_used = _build_query(active_groups, since_date, text_keywords)
         items = await _run_search(query_used)
 
     if not items:
