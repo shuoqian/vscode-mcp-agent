@@ -19,10 +19,49 @@ from langchain_core.prompts import PromptTemplate
 load_dotenv()
 
 llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
+    model="openai/gpt-oss-120b",
     temperature=0.0,
     model_kwargs={"response_format": {"type": "json_object"}}
 )
+
+# ---------------------------------------------------------------------
+# REPORT VERIFIER AGENT — a genuinely separate agent, not another prompt
+# on the same "role."
+#
+# This is deliberately its own ChatGroq instance with its own config,
+# distinct from both `llm` (planner/ReAct judge) and `text_llm` (report
+# writer, instantiated inside final_summary_node): temperature=0.0 and
+# JSON mode, because its job is strict, deterministic fact-checking, not
+# fluent prose. It has no stake in the draft report looking good — its
+# only objective is to catch claims that aren't grounded in the source
+# issue text, and it has real veto power (via `is_reliable`) over what
+# the user ultimately sees, not just a cosmetic pass.
+# ---------------------------------------------------------------------
+critic_llm = ChatGroq(
+    model="openai/gpt-oss-120b",
+    temperature=0.0,
+    model_kwargs={"response_format": {"type": "json_object"}}
+)
+
+
+def _build_fallback_report(pooled_issues: list[dict]) -> str:
+    """
+    Deterministic, non-LLM report used ONLY when the Report Verifier Agent
+    judges the drafted narrative too unreliable to salvage by editing. No
+    LLM involvement here at all — just the raw, already-verified issue data
+    — so this fallback can't itself introduce new unsupported claims.
+    """
+    lines = [
+        "# Executive Report (Narrative Suppressed — Verification Failed)",
+        "",
+        "The drafted narrative report for this run could not be verified against its "
+        "source issues and has been withheld to avoid presenting unsupported claims. "
+        "Below are the raw, individually-verified candidate issues only:",
+        "",
+    ]
+    for i in pooled_issues:
+        lines.append(f"- **Issue #{i['number']}** ({i['title']}) — Confidence: {i['confidence']:.2f} — {i['url']}")
+    return "\n".join(lines)
 
 
 def extract_text(content: Any) -> str:
@@ -537,7 +576,7 @@ async def final_summary_node(state: AgentState):
     is_abstained = state.get("is_abstained", False)
 
     print("\n" + "="*65)
-    print(" 📊 [FINAL NODE] Generating Report & Updating Memory")
+    print(" 📊 [FINAL NODE] Generating Draft Report & Updating Memory")
     print("="*65)
 
     if is_abstained or not pooled:
@@ -546,7 +585,9 @@ async def final_summary_node(state: AgentState):
             "Reason: Matching issues yielded insufficient confidence (< 0.80 threshold) or API limits/errors prevented verification.\n"
             "Recommendation: Broaden your search criteria or retry after rate limits reset."
         )
-        return {"aggregate_summary": summary_text}
+        # Abstention has nothing to verify — set aggregate_summary directly
+        # and skip the critic node entirely (see route_after_final_summary).
+        return {"aggregate_summary": summary_text, "draft_summary": "", "source_evidence_text": ""}
 
     combined_text = "\n".join([
         f"• Issue #{i['number']} ({i['title']}) [Confidence: {i['confidence']:.2f}]\n  URL: {i['url']}\n  Snippet: {i['body'][:300]}..."
@@ -559,7 +600,7 @@ async def final_summary_node(state: AgentState):
         "Provide a clean, well-structured markdown executive report highlighting patterns, affected components, and root causes."
     )
 
-    text_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.2)
+    text_llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.2)
     final_res = await (summary_prompt | text_llm).ainvoke({
         "symptom_type": state["symptom_type"],
         "target_module": state["target_module"],
@@ -570,7 +611,116 @@ async def final_summary_node(state: AgentState):
     print("  └─► [Vector Memory Commit] Persisting newly summarized issues into ChromaDB...")
     save_issues_to_vector_memory(pooled)
 
-    return {"aggregate_summary": extract_text(final_res.content)}
+    # NOTE: this is a DRAFT only. aggregate_summary is intentionally left
+    # unset here — it's populated downstream by report_critic_node, which
+    # has final say over what actually reaches the user.
+    return {
+        "draft_summary": extract_text(final_res.content),
+        "source_evidence_text": combined_text,
+    }
+
+
+# =====================================================================
+# NODE 6: Report Verifier Agent — independent fact-check of the draft
+# =====================================================================
+async def report_critic_node(state: AgentState):
+    """
+    A second, independent agent (see `critic_llm` above) that audits the
+    drafted report against the actual source issue text it was supposed to
+    be grounded in. This is a genuine generator/verifier multi-agent
+    handoff: the writer (final_summary_node's text_llm) and the verifier
+    (critic_llm) are different agent instances with different objectives
+    and different sampling configs, and the verifier has real authority to
+    override the writer's output — up to and including discarding the
+    narrative entirely in favor of a deterministic fallback (see 9.5-style
+    reasoning: no single layer's output is trusted unchecked).
+    """
+    draft = state.get("draft_summary", "")
+    pooled = state.get("pooled_issues", [])
+    source_evidence = state.get("source_evidence_text", "")
+
+    print("\n" + "="*65)
+    print(" 🕵️ [REPORT VERIFIER AGENT] Auditing draft against source evidence")
+    print("="*65)
+
+    if not draft or not pooled:
+        # Nothing to verify — shouldn't normally be reached since the
+        # abstention path skips this node entirely, but guarded defensively.
+        return {"aggregate_summary": draft, "flagged_claims": [], "report_verified": True}
+
+    critic_prompt = PromptTemplate.from_template(
+        "You are an independent Report Verification Agent. Your ONLY job is to audit a DRAFT "
+        "executive report against its SOURCE EVIDENCE (the original GitHub issue excerpts it was "
+        "supposed to be based on) and catch any claim in the draft that is NOT actually supported "
+        "by the source evidence — including plausible-sounding root-cause explanations, invented "
+        "technical details, or generalized recommendations that go beyond what the source material "
+        "actually states.\n\n"
+        "You did not write the draft and have no stake in it looking good. Your goal is strict, "
+        "adversarial accuracy checking, not politeness.\n\n"
+        "SOURCE EVIDENCE (the only material any claim in the draft may be grounded in):\n"
+        "{source_evidence}\n\n"
+        "DRAFT REPORT TO AUDIT:\n"
+        "{draft_summary}\n\n"
+        "Instructions:\n"
+        "1. Identify every claim in the draft stating a cause, pattern, or recommendation NOT "
+        "directly traceable to the source evidence above.\n"
+        "2. Produce a corrected 'verified_summary': the same report with unsupported claims removed "
+        "or rewritten as explicitly-labeled speculation (prefix with 'Possible interpretation "
+        "(not confirmed by source):'). Keep everything that IS grounded intact.\n"
+        "3. Set 'is_reliable' to false ONLY if the draft is so disconnected from the source evidence "
+        "that no coherent, grounded report can be salvaged by editing — this should be rare.\n"
+        "4. Return ONLY valid JSON, no extra commentary.\n\n"
+        "JSON Format:\n"
+        "{{\n"
+        '  "flagged_claims": [{{"claim": "short quote or paraphrase of the unsupported claim", '
+        '"reason": "why it is not supported by the source evidence"}}],\n'
+        '  "is_reliable": true,\n'
+        '  "verified_summary": "the corrected markdown report"\n'
+        "}}"
+    )
+
+    try:
+        res = await (critic_prompt | critic_llm).ainvoke({
+            "source_evidence": source_evidence,
+            "draft_summary": draft,
+        })
+        parsed = json.loads(extract_text(res.content))
+        flagged_claims = parsed.get("flagged_claims", [])
+        is_reliable = bool(parsed.get("is_reliable", True))
+        verified_summary = parsed.get("verified_summary", "") or draft
+    except Exception as e:
+        print(f"  ⚠️ [Report Verifier Exception]: {e}. Falling back to deterministic report as a safety measure.")
+        flagged_claims = [{"claim": "N/A", "reason": f"Verifier agent call failed: {e}"}]
+        is_reliable = False
+        verified_summary = ""
+
+    if flagged_claims:
+        print(f"  ├─► [Flagged Claims] {len(flagged_claims)} unsupported claim(s) found in draft:")
+        for c in flagged_claims:
+            print(f"  │     • \"{c.get('claim', '')}\" — {c.get('reason', '')}")
+    else:
+        print("  ├─► [Flagged Claims] None — draft is fully grounded in source evidence.")
+
+    if not is_reliable:
+        print("  └─► [VETO] Verifier judged the draft unsalvageable. Substituting deterministic fallback report.")
+        final_text = _build_fallback_report(pooled)
+    else:
+        print("  └─► [ACCEPTED] Verified summary approved for delivery.")
+        final_text = verified_summary
+
+    return {
+        "aggregate_summary": final_text,
+        "flagged_claims": flagged_claims,
+        "report_verified": is_reliable,
+    }
+
+
+def route_after_final_summary(state: AgentState) -> Literal["report_critic", "end"]:
+    # Abstention has nothing to verify — go straight to END rather than
+    # invoking the critic agent on an empty/notice-only draft.
+    if state.get("is_abstained", False):
+        return "end"
+    return "report_critic"
 
 
 # =====================================================================
@@ -583,6 +733,7 @@ workflow.add_node("fetch_issues", fetch_issues_node)
 workflow.add_node("process_issues_react", process_issues_react_node)
 workflow.add_node("verify_and_reflect", verify_and_reflect_node)
 workflow.add_node("final_summary", final_summary_node)
+workflow.add_node("report_critic", report_critic_node)
 
 workflow.set_entry_point("planner")
 workflow.add_edge("planner", "fetch_issues")
@@ -598,6 +749,15 @@ workflow.add_conditional_edges(
     }
 )
 
-workflow.add_edge("final_summary", END)
+workflow.add_conditional_edges(
+    "final_summary",
+    route_after_final_summary,
+    {
+        "report_critic": "report_critic",
+        "end": END
+    }
+)
+
+workflow.add_edge("report_critic", END)
 
 app_agent = workflow.compile()

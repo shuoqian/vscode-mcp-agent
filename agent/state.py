@@ -56,4 +56,13 @@ class AgentState(TypedDict):
     reflection_count: int           # Dynamic loop counter
     critique_feedback: str          # Feedback from reflection step
     aggregate_summary: str
+
+    # NEW: Report Verifier Agent state — a distinct agent, distinct from the
+    # report writer, that audits draft_summary against source_evidence_text
+    # before aggregate_summary is finalized.
+    draft_summary: str            # unverified report text from final_summary_node
+    source_evidence_text: str     # the pooled-issue excerpts the draft was supposed to be grounded in
+    flagged_claims: List[Dict[str, Any]]  # claims the critic judged unsupported
+    report_verified: bool         # False if the critic vetoed the narrative (fell back to deterministic report)
+
     logs: List[str]

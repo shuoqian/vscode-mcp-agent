@@ -72,6 +72,10 @@ async def main():
         "reflection_count": 0,
         "critique_feedback": "",
         "aggregate_summary": "",
+        "draft_summary": "",
+        "source_evidence_text": "",
+        "flagged_claims": [],
+        "report_verified": True,
         "logs": []
     }
 
@@ -81,11 +85,28 @@ async def main():
         final_state = await app_agent.ainvoke(initial_state)
 
         is_abstained = final_state.get("is_abstained", False)
-        border_style = "yellow" if is_abstained else "green"
-        title_style = "bold yellow" if is_abstained else "bold green"
+        report_verified = final_state.get("report_verified", True)
+        flagged_claims = final_state.get("flagged_claims", [])
+
+        if is_abstained:
+            border_style, title_style = "yellow", "bold yellow"
+        elif not report_verified:
+            border_style, title_style = "red", "bold red"
+        else:
+            border_style, title_style = "green", "bold green"
+
+        verification_note = ""
+        if not is_abstained:
+            if not report_verified:
+                verification_note = "[bold red]Narrative suppressed by Report Verifier Agent — showing raw verified issues only.[/bold red]\n"
+            elif flagged_claims:
+                verification_note = f"[yellow]Report Verifier Agent removed/hedged {len(flagged_claims)} unsupported claim(s) before delivery.[/yellow]\n"
+            else:
+                verification_note = "[dim]Report Verifier Agent: fully grounded, no claims flagged.[/dim]\n"
 
         summary_panel = Panel(
             f"[bold white]Executive Summary:[/bold white]\n"
+            f"{verification_note}"
             f"{final_state.get('aggregate_summary', 'No summary generated.')}",
             title=f"[{title_style}][VS Code Alert] {target_module} Issues ({target_os})[/{title_style}]",
             subtitle=(
