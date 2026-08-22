@@ -1,6 +1,8 @@
 import os
 import json
 import asyncio
+import time
+import functools
 from typing import Any, Literal
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
@@ -10,8 +12,7 @@ from agent.tools import (
     GitHubLabelManager,
     fetch_github_issues_tool,
     estimate_issue_count,
-    check_vector_memory_duplicate,
-    save_issues_to_vector_memory
+    check_vector_memory_duplicate
 )
 from langchain_groq import ChatGroq
 from langchain_core.prompts import PromptTemplate
@@ -80,9 +81,35 @@ def extract_text(content: Any) -> str:
     return str(content).strip()
 
 
+def _time_node(name: str):
+    """
+    Lightweight latency instrumentation (Section 12.3 metric: latency).
+    Wraps a node so its wall-clock time is recorded into
+    AgentState['node_latencies'] without touching the node's own logic.
+    Time is ACCUMULATED per name across multiple invocations of the same
+    node (e.g. process_issues_react_node during reflection retries), so the
+    metric reflects total time spent in that node across the whole run,
+    not just its most recent call.
+    """
+    def decorator(fn):
+        @functools.wraps(fn)
+        async def wrapper(state):
+            start = time.perf_counter()
+            result = await fn(state)
+            elapsed = time.perf_counter() - start
+            latencies = dict(state.get("node_latencies", {}) or {})
+            latencies[name] = round(latencies.get(name, 0.0) + elapsed, 3)
+            result = dict(result or {})
+            result["node_latencies"] = latencies
+            return result
+        return wrapper
+    return decorator
+
+
 # =====================================================================
 # NODE 1: Dynamic Router & Planner Node
 # =====================================================================
+@_time_node("planner")
 async def planner_node(state: AgentState):
     target_os = state["target_os"]
     target_module = state["target_module"]
@@ -271,6 +298,7 @@ async def planner_node(state: AgentState):
     print(f"  └─► Unmatched Keywords (informational only, not queried): {unmatched_keywords}")
 
     flat_hard_labels = sorted({l for labels in hard_label_groups.values() for l in labels})
+    tot_selected_branch = max(tot_trace, key=lambda b: b["score"])["name"] if tot_trace else ""
 
     return {
         "constructed_query": constructed_query,
@@ -278,6 +306,7 @@ async def planner_node(state: AgentState):
         "hard_label_groups": hard_label_groups,
         "text_keywords": text_keywords,
         "tot_branch_trace": tot_trace,
+        "tot_selected_branch": tot_selected_branch,
         "hard_labels": flat_hard_labels,  # backward-compat flat view
         "soft_labels": soft_labels,
         "matched_labels": flat_hard_labels + soft_labels,  # backward-compat display field
@@ -363,6 +392,7 @@ async def select_query_strategy_tot(
 # =====================================================================
 # NODE 2: Fetch & Cross-Session Vector Memory Node
 # =====================================================================
+@_time_node("fetch_issues")
 async def fetch_issues_node(state: AgentState):
     days = state["time_range_days"]
     hard_label_groups = state.get("hard_label_groups", {})
@@ -404,12 +434,14 @@ async def fetch_issues_node(state: AgentState):
         "raw_issues": raw_issues,
         "vector_filtered_issues": vector_filtered_issues,
         "constructed_query": query_used,
+        "used_unfiltered_fallback": used_unfiltered_fallback,
     }
 
 
 # =====================================================================
 # NODE 3: Per-Issue ReAct Processing Node
 # =====================================================================
+@_time_node("process_issues_react")
 async def process_issues_react_node(state: AgentState):
     """Executes verification tasks on target issues strictly."""
     issues_to_process = state.get("vector_filtered_issues", [])
@@ -519,6 +551,7 @@ async def process_issues_react_node(state: AgentState):
 # =====================================================================
 # NODE 4: Verify, Reflect & Abstention Gate Node
 # =====================================================================
+@_time_node("verify_and_reflect")
 async def verify_and_reflect_node(state: AgentState):
     pooled_issues = state.get("pooled_issues", [])
     pool_confidence = state.get("pool_confidence_score", 0.0)
@@ -569,14 +602,15 @@ def route_after_verification(state: AgentState) -> Literal["process_issues_react
 
 
 # =====================================================================
-# NODE 5: Final Summary Synthesis & Memory Commit Node
+# NODE 5: Final Summary Synthesis Node
 # =====================================================================
+@_time_node("final_summary")
 async def final_summary_node(state: AgentState):
     pooled = state.get("pooled_issues", [])
     is_abstained = state.get("is_abstained", False)
 
     print("\n" + "="*65)
-    print(" 📊 [FINAL NODE] Generating Draft Report & Updating Memory")
+    print(" 📊 [FINAL NODE] Generating Draft Report")
     print("="*65)
 
     if is_abstained or not pooled:
@@ -608,12 +642,13 @@ async def final_summary_node(state: AgentState):
         "combined_text": combined_text
     })
 
-    print("  └─► [Vector Memory Commit] Persisting newly summarized issues into ChromaDB...")
-    save_issues_to_vector_memory(pooled)
-
     # NOTE: this is a DRAFT only. aggregate_summary is intentionally left
     # unset here — it's populated downstream by report_critic_node, which
-    # has final say over what actually reaches the user.
+    # has final say over what actually reaches the user. The ChromaDB
+    # vector-memory commit is ALSO intentionally deferred — it now happens
+    # in main.py, gated on the human reviewer's response (Section 12.4),
+    # not automatically here. This means a report a human rejects does not
+    # get its issues silently remembered as "already reported."
     return {
         "draft_summary": extract_text(final_res.content),
         "source_evidence_text": combined_text,
@@ -623,6 +658,7 @@ async def final_summary_node(state: AgentState):
 # =====================================================================
 # NODE 6: Report Verifier Agent — independent fact-check of the draft
 # =====================================================================
+@_time_node("report_critic")
 async def report_critic_node(state: AgentState):
     """
     A second, independent agent (see `critic_llm` above) that audits the

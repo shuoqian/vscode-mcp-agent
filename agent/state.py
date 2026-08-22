@@ -38,6 +38,17 @@ class AgentState(TypedDict):
     # their estimated result counts/scores, and which one won — purely for
     # transparency/logging, not consumed by downstream nodes.
     tot_branch_trace: List[Dict[str, Any]]
+    tot_selected_branch: str  # name of the winning branch ("narrow"/"broad"/"keyword") — for metrics logging
+
+    # NEW: whether the Fetch node had to fall back to a fully unfiltered
+    # query (every hard-label category dropped) — a red flag surfaced to
+    # the human reviewer in main.py (Section 12.4) since it means no
+    # topical filter actually matched.
+    used_unfiltered_fallback: bool
+
+    # NEW: per-node wall-clock latency (seconds), accumulated across retries
+    # for nodes invoked more than once. Section 12.3 latency metric.
+    node_latencies: Dict[str, float]
 
     # Kept for backward compatibility / display purposes only.
     hard_labels: List[str]
