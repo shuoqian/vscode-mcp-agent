@@ -1,8 +1,6 @@
 # VS Code Intelligent Issue & Signal Tracking Agent - Design Document
 
-**Course:** CMU Agentic AI Capstone | **Target Repository:** microsoft/vscode
-**Status:** Implementation Phase (Module 3, updated)
-**Disclaimer:** Some of the content is created by learning through Gemini 3.6 flash
+**Target Repository:** microsoft/vscode
 
 ## 1. Selected Agent, Problem Statement, & Target User
 ### Problem & Core Agent Concept
